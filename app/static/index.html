@@ -100,6 +100,47 @@
     </div>
     <textarea id="outputPreview" class="hidden" spellcheck="false" wrap="off" readonly></textarea>
   </section>
+
+  <section class="card" id="compareCard">
+    <div class="card-head">
+      <h2>4. 样本对比</h2>
+      <div class="hint">把两份解析结果保存为样本 A / B（仅保存在浏览器本地），按树路径对齐比较每个部分的
+        媒体类型、头部、正文编码、boundary、序言/尾注与诊断代码。</div>
+    </div>
+
+    <div class="snap-grid">
+      <div class="snap-slot">
+        <div class="snap-head">
+          <span class="snap-tag tag-a">样本 A</span>
+          <span class="snap-meta" id="snapMetaA">未保存</span>
+        </div>
+        <div class="snap-actions">
+          <button id="btnSaveA" class="btn btn-sm" type="button" disabled>保存当前解析为 A</button>
+          <button id="btnLoadA" class="btn btn-sm btn-ghost" type="button" disabled>载入编辑器</button>
+          <button id="btnClearA" class="btn btn-sm btn-danger" type="button" disabled>清除</button>
+        </div>
+      </div>
+      <div class="snap-slot">
+        <div class="snap-head">
+          <span class="snap-tag tag-b">样本 B</span>
+          <span class="snap-meta" id="snapMetaB">未保存</span>
+        </div>
+        <div class="snap-actions">
+          <button id="btnSaveB" class="btn btn-sm" type="button" disabled>保存当前解析为 B</button>
+          <button id="btnLoadB" class="btn btn-sm btn-ghost" type="button" disabled>载入编辑器</button>
+          <button id="btnClearB" class="btn btn-sm btn-danger" type="button" disabled>清除</button>
+        </div>
+      </div>
+    </div>
+
+    <div class="actions">
+      <button id="btnCompare" class="btn btn-primary" type="button" disabled>开始对比</button>
+      <button id="btnExportDiff" class="btn" type="button" disabled>导出 JSON 差异报告</button>
+      <span id="diffMeta" class="parse-meta"></span>
+    </div>
+
+    <div id="diffResult"></div>
+  </section>
 </main>
 
 <footer class="footer">

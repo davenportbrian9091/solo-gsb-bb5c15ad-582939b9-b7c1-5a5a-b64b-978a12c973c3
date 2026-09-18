@@ -17,6 +17,11 @@
   preamble / epilogue，可新增或删除部分；
 - 🔁 **重新编码并下载**：按（可能已修改的）boundary 规则以 CRLF 重新生成报文，
   可选择是否包含顶层头部；未修改的部分逐字节还原（含二进制）。
+- 🆚 **样本对比**：把两份解析结果保存为浏览器本地样本 A / B，按树路径
+  （`root`、`parts[0]`、`parts[0].parts[1]`…）对齐比较每个部分的媒体类型、
+  头部、正文与正文编码、boundary、序言/尾注及诊断代码；差异以可展开的
+  新增/删除/修改清单展示，点击条目即可在结构树中定位对应节点，并可一键
+  导出 JSON 差异报告。
 
 ---
 
@@ -70,6 +75,15 @@ http://localhost:8000/docs 。
    或增删子部分。
 4. 勾选/取消“编码时包含顶层头部”，点击 **重新编码并下载**。
 5. 在结果区可重新下载、复制为文本，或查看编码后的完整报文。
+6. **样本对比**（页面第 4 区）：
+   - 解析一份报文后点击 **保存当前解析为 A**；再解析（或编辑）另一份，
+     点击 **保存当前解析为 B**；样本仅保存在浏览器 `localStorage`，可跨会话保留；
+   - 点击 **开始对比**，按树路径对齐展示新增 / 删除 / 修改三组差异，
+     每组可折叠，修改条目逐字段列出前后值（正文等长文本显示截断预览与长度）；
+   - 点击条目上的 **定位 A / 定位 B**，编辑器自动载入对应样本并展开、
+     高亮该路径的节点；**载入编辑器** 按钮也可随时把某个样本整体取回编辑；
+   - 点击 **导出 JSON 差异报告** 下载 `mime-diff-report.json`
+     （含样本元信息、汇总计数与全部差异条目）。
 
 > 不是合法 UTF-8 的正文（如二进制附件）会以 **base64** 呈现；只要不修改，
 > 重新编码时会逐字节还原。
@@ -167,6 +181,62 @@ http://localhost:8000/docs 。
 }
 ```
 
+### `POST /api/diff`
+
+样本对比：输入两份 `/api/parse` 的结果（`tree` + `issues`），按树路径
+（`root`、`parts[0]`、`parts[0].parts[1]`…）对齐比较。
+
+请求：
+
+```json
+{
+  "a": { "tree": { /* 样本 A 的 tree */ }, "issues": [ /* 样本 A 的 issues，可省略 */ ] },
+  "b": { "tree": { /* 样本 B 的 tree */ }, "issues": [] }
+}
+```
+
+响应（节选）：
+
+```json
+{
+  "ok": true,
+  "identical": false,
+  "summary": { "added": 1, "removed": 0, "modified": 2, "unchanged": 3 },
+  "entries": [
+    {
+      "kind": "modified",
+      "path": "root",
+      "nodeKindA": "multipart", "nodeKindB": "multipart",
+      "mediaTypeA": "multipart/mixed", "mediaTypeB": "multipart/mixed",
+      "changes": [
+        { "field": "boundary", "a": "OUTER", "b": "OUTER-2" },
+        { "field": "headers",
+          "added": [{ "name": "X-Trace", "values": ["1"] }],
+          "removed": [],
+          "changed": [{ "name": "Content-Type", "a": ["…OUTER"], "b": ["…OUTER-2"] }] },
+        { "field": "preamble", "aPreview": "hi", "bPreview": "hi!",
+          "aLength": 2, "bLength": 3 },
+        { "field": "issues", "a": [], "b": ["MISSING_CLOSE_DELIMITER"],
+          "added": ["MISSING_CLOSE_DELIMITER"], "removed": [] }
+      ]
+    },
+    { "kind": "added", "path": "parts[2]", "nodeKind": "part",
+      "mediaType": "text/csv", "nodeCount": 1, "name": "report" }
+  ]
+}
+```
+
+条目类型与字段：
+
+| 字段 | 说明 |
+| --- | --- |
+| `kind` | `added`（仅 B 有）/ `removed`（仅 A 有）/ `modified`（两侧都有但内容不同） |
+| `path` | 树路径，与前端结构树节点的 `data-path` 一致，可用于定位 |
+| `changes[].field` | `kind` / `mediaType` / `headers` / `boundary` / `leadingCrlf` / `preamble` / `preambleEncoding` / `epilogue` / `epilogueEncoding` / `hasHeaders` / `body` / `bodyEncoding` / `issues` |
+| 正文类字段 | 只返回 `aPreview` / `bPreview`（截断预览）与 `aLength` / `bLength`，避免报告过大 |
+| `issues` 变化 | 诊断代码按 issue 消息中的路径前缀归属到节点，做多重集比较 |
+| `nodeCount` | 新增 / 删除子树包含的节点总数（含自身） |
+
 ### `GET /api/health`
 
 返回 `{"ok": true}`，供容器健康检查使用。
@@ -179,14 +249,15 @@ http://localhost:8000/docs 。
 .
 ├── app/
 │   ├── __init__.py
-│   ├── main.py              # FastAPI 应用、/api/parse、/api/encode、静态文件
+│   ├── main.py              # FastAPI 应用：/api/parse、/api/encode、/api/diff、静态文件
 │   ├── mime.py              # 零第三方依赖的 MIME 解析 / 重新编码核心
+│   ├── diff.py              # 样本对比：按树路径对齐比较两份解析结果
 │   └── static/
-│       ├── index.html       # 页面结构
+│       ├── index.html       # 页面结构（输入 / 诊断 / 编辑树 / 编码 / 样本对比）
 │       ├── styles.css       # 深色主题样式
-│       └── app.js           # 原生 JS：示例、树形编辑器、下载
+│       └── app.js           # 原生 JS：示例、树形编辑器、样本快照与差异展示、下载
 ├── tests/
-│   └── smoke_test.py        # 解析/编码端到端测试（仅需 Python 标准库）
+│   └── smoke_test.py        # 解析/编码/对比端到端测试（仅需 Python 标准库）
 ├── requirements.txt
 ├── Dockerfile
 ├── docker-compose.yml
@@ -203,7 +274,8 @@ python3 tests/smoke_test.py
 
 覆盖：基本 form-data、CJK、嵌套 multipart、preamble/epilogue、
 引号与转义参数、boundary 覆盖、定界符碰撞、缺关闭定界符、LF 规范化、
-二进制逐字节往返、编辑后重新编码等。
+二进制逐字节往返、编辑后重新编码，以及样本对比（新增/删除/修改条目、
+头部与诊断代码对齐、嵌套路径、自比一致性）。
 
 ---
 

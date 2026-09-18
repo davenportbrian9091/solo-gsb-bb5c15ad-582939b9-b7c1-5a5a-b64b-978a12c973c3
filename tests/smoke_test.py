@@ -196,5 +196,90 @@ enc10 = mime.encode_tree(r10p["tree"], include_headers=False)
 out10 = base64.b64decode(enc10["payloadBase64"])
 check("body-only 带序言往返", out10 == raw10, f"\n{out10!r}\n!=\n{raw10!r}")
 
+# 11. 样本对比：按树路径对齐的 diff ------------------------------------------
+print("11) 样本对比")
+from app import diff as diffmod
+
+ra = mime.parse_message(raw.decode(), None, None)
+rb = mime.parse_message(raw.decode(), None, None)
+tb = rb["tree"]
+tb["boundary"] = "NEW-B"                                   # root boundary 变化
+tb["parts"][0]["body"] = "bob"                             # parts[0] 正文变化
+tb["parts"][1]["mediaType"] = "text/html"                  # parts[1] 媒体类型变化
+tb["parts"][1]["bodyEncoding"] = "base64"                  # parts[1] 正文编码变化
+tb["parts"][1]["headers"].append({"name": "X-Extra", "value": "yes", "raw": ""})
+rep = diffmod.compare_results(ra["tree"], ra["issues"], rb["tree"], rb["issues"])
+by_path = {e["path"]: e for e in rep["entries"]}
+check("对比返回 ok", rep["ok"] and not rep["identical"])
+check("3 个节点被修改", rep["summary"]["modified"] == 3, rep["summary"])
+root_fields = {c["field"] for c in by_path["root"]["changes"]}
+check("root boundary 变化被捕获", "boundary" in root_fields, by_path["root"])
+p0 = {c["field"]: c for c in by_path["parts[0]"]["changes"]}
+check("正文变化带预览与长度",
+      p0["body"]["bPreview"] == "bob" and p0["body"]["aLength"] == 5, p0.get("body"))
+p1 = {c["field"]: c for c in by_path["parts[1]"]["changes"]}
+check("媒体类型变化", p1["mediaType"]["a"] == "application/octet-stream"
+      and p1["mediaType"]["b"] == "text/html")
+check("正文编码变化", p1["bodyEncoding"]["a"] == "utf-8"
+      and p1["bodyEncoding"]["b"] == "base64")
+check("头部新增检测", p1["headers"]["added"] == [{"name": "X-Extra", "values": ["yes"]}],
+      p1["headers"])
+
+same = diffmod.compare_results(ra["tree"], ra["issues"], ra["tree"], ra["issues"])
+check("自比完全一致", same["identical"] and same["entries"] == []
+      and same["summary"]["unchanged"] == 3, same["summary"])
+
+# 11b. 新增 / 删除子树
+rc = mime.parse_message(raw.decode(), None, None)
+tc = rc["tree"]
+tc["parts"].append({"kind": "part", "mediaType": "text/csv", "headers": [],
+                    "hasHeaders": False, "body": "a,b", "bodyEncoding": "utf-8",
+                    "rawSize": 3})
+rep2 = diffmod.compare_results(ra["tree"], ra["issues"], tc, rc["issues"])
+added = [e for e in rep2["entries"] if e["kind"] == "added"]
+check("新增子树检测", len(added) == 1 and added[0]["path"] == "parts[2]"
+      and added[0]["mediaType"] == "text/csv", added)
+tc2 = mime.parse_message(raw.decode(), None, None)["tree"]
+tc2["parts"].pop()
+rep3 = diffmod.compare_results(ra["tree"], ra["issues"], tc2, [])
+removed = [e for e in rep3["entries"] if e["kind"] == "removed"]
+check("删除子树检测", len(removed) == 1 and removed[0]["path"] == "parts[1]"
+      and removed[0]["nodeCount"] == 1, removed)
+
+# 11c. 嵌套新增整棵子树（nodeCount 统计后代）
+r_out = mime.parse_message(raw2.decode(), None, None)
+t_out = mime.parse_message(raw2.decode(), None, None)["tree"]   # 独立副本再修改
+t_out["parts"][1]["parts"].append(
+    {"kind": "part", "mediaType": "text/plain", "headers": [],
+     "hasHeaders": False, "body": "x", "bodyEncoding": "utf-8", "rawSize": 1})
+rep4 = diffmod.compare_results(r_out["tree"], r_out["issues"], t_out, r_out["issues"])
+added4 = [e for e in rep4["entries"] if e["kind"] == "added"]
+check("嵌套新增路径对齐", len(added4) == 1
+      and added4[0]["path"] == "parts[1].parts[2]", added4)
+
+# 11d. 诊断代码按节点归属并比较
+r_clean = mime.parse_message(raw.decode(), None, None)
+r_broken = mime.parse_message(raw[: raw.rfind(b"------B--")].decode(), None, None)
+check("构造的坏样本缺关闭定界符",
+      any(i["code"] == "MISSING_CLOSE_DELIMITER" for i in r_broken["issues"]))
+rep5 = diffmod.compare_results(r_clean["tree"], r_clean["issues"],
+                               r_broken["tree"], r_broken["issues"])
+root_entry = next(e for e in rep5["entries"] if e["path"] == "root")
+iss = next(c for c in root_entry["changes"] if c["field"] == "issues")
+check("诊断代码差异（新增 MISSING_CLOSE_DELIMITER）",
+      "MISSING_CLOSE_DELIMITER" in iss["added"], iss)
+
+# 11e. 序言 / 尾注变化
+r_p = mime.parse_message(raw2.decode(), None, None)
+t_p = r_p["tree"]
+t_p["preamble"] = "changed preamble"
+t_p["epilogue"] = ""
+rep6 = diffmod.compare_results(r_out["tree"], r_out["issues"], t_p, r_p["issues"])
+root6 = {c["field"]: c for c in
+         next(e for e in rep6["entries"] if e["path"] == "root")["changes"]}
+check("序言变化检测", root6["preamble"]["bPreview"] == "changed preamble")
+check("尾注变化检测", root6["epilogue"]["aLength"] > 0
+      and root6["epilogue"]["bLength"] == 0)
+
 print(f"\n结果: {PASS} 通过, {FAIL} 失败")
 sys.exit(1 if FAIL else 0)

@@ -1,4 +1,4 @@
-"""FastAPI 入口：提供解析、重新编码 API 与静态前端。"""
+"""FastAPI 入口：提供解析、重新编码、样本对比 API 与静态前端。"""
 
 from __future__ import annotations
 
@@ -9,12 +9,14 @@ from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
+from .diff import compare_results
 from .mime import encode_tree, parse_message
 
 app = FastAPI(
     title="MIME Multipart 报文检查器",
-    description="按 RFC 2046 解析嵌套 multipart，编辑后按原 boundary 规则重新编码。",
-    version="1.0.0",
+    description="按 RFC 2046 解析嵌套 multipart，编辑后按原 boundary 规则重新编码；"
+                "支持两份解析结果的样本对比。",
+    version="1.1.0",
 )
 
 STATIC_DIR = os.path.join(os.path.dirname(__file__), "static")
@@ -39,6 +41,17 @@ class EncodeRequest(BaseModel):
     model_config = {"populate_by_name": True}
 
 
+class DiffSide(BaseModel):
+    tree: dict = Field(description="/api/parse 返回的 tree（可为编辑后的版本）")
+    issues: list[dict] = Field(default_factory=list,
+                               description="/api/parse 返回的 issues，用于按节点归属诊断代码")
+
+
+class DiffRequest(BaseModel):
+    a: DiffSide = Field(description="样本 A")
+    b: DiffSide = Field(description="样本 B")
+
+
 @app.get("/api/health")
 def health():
     return {"ok": True}
@@ -54,6 +67,12 @@ def api_parse(req: ParseRequest):
 @app.post("/api/encode")
 def api_encode(req: EncodeRequest):
     result = encode_tree(req.tree, req.include_headers)
+    return JSONResponse(result)
+
+
+@app.post("/api/diff")
+def api_diff(req: DiffRequest):
+    result = compare_results(req.a.tree, req.a.issues, req.b.tree, req.b.issues)
     return JSONResponse(result)
 
 

@@ -9,6 +9,11 @@ let tree = null;              // 当前可编辑树（对象引用，控件直�
 let encodedBytes = null;      // Uint8Array 编码结果
 const issueFilter = { error: true, warning: true, info: true };
 
+// 样本对比：A/B 两份快照（含完整解析结果，保存在 localStorage）
+const snapshots = { a: null, b: null };
+let diffReport = null;        // 最近一次 /api/diff 返回
+let editorSource = null;      // 当前编辑器内容来源："a" | "b" | null（新解析）
+
 // ---------------------------------------------------------------- samples --
 
 // 说明：RFC 2046 要求首定界符前有 CRLF；顶层头部块后的空行已提供该 CRLF，
@@ -205,6 +210,7 @@ function headerRow(table, node, idx) {
 function renderNode(node, depth) {
   const wrap = document.createElement("div");
   wrap.className = "node";
+  wrap.dataset.path = node.path || "";
   const isMulti = node.kind === "multipart";
 
   const titleParts = [];
@@ -389,6 +395,7 @@ async function doParse() {
     });
     parseResult = data;
     tree = data.tree;
+    editorSource = null;      // 新解析结果，与已保存样本无关联
     setCounts(data.counts);
     $("#effectiveBoundary").textContent = data.effectiveBoundary ?? "—（无）";
     const metaBits = [];
@@ -403,6 +410,7 @@ async function doParse() {
     $("#outputCard").classList.add("hidden");
     renderIssues($("#issuesList"), data.issues);
     rerenderTree();
+    renderSnapSlots();
   } catch (e) {
     alert("解析失败：" + e.message);
   } finally {
@@ -484,6 +492,362 @@ async function copyOutput() {
   }
 }
 
+// ---------------------------------------------------------- sample compare --
+
+const SNAP_LS_KEY = { a: "mimeSnapA", b: "mimeSnapB" };
+
+const DIFF_KIND_LABEL = { added: "新增", removed: "删除", modified: "修改" };
+const DIFF_FIELD_LABEL = {
+  kind: "节点类型",
+  mediaType: "媒体类型",
+  headers: "头部",
+  boundary: "boundary",
+  leadingCrlf: "首定界符前 CRLF",
+  preamble: "序言 preamble",
+  preambleEncoding: "序言编码",
+  epilogue: "尾注 epilogue",
+  epilogueEncoding: "尾注编码",
+  hasHeaders: "头部块",
+  body: "正文",
+  bodyEncoding: "正文编码",
+  issues: "诊断代码",
+};
+
+function deepClone(o) {
+  return JSON.parse(JSON.stringify(o));
+}
+
+function saveSnapshot(side) {
+  if (!parseResult || !tree) {
+    alert("请先解析一份报文，再保存为样本");
+    return;
+  }
+  reindexPaths(tree, "root");
+  const result = deepClone(parseResult);   // parseResult.tree 即当前编辑器树
+  snapshots[side] = {
+    label: `样本 ${side.toUpperCase()}`,
+    savedAt: new Date().toISOString(),
+    result,
+  };
+  persistSnapshot(side);
+  resetDiffView();
+  renderSnapSlots();
+}
+
+function loadSnapshotIntoEditor(side) {
+  const snap = snapshots[side];
+  if (!snap) return false;
+  parseResult = deepClone(snap.result);    // 深拷贝，编辑器改动不污染样本
+  tree = parseResult.tree;
+  editorSource = side;
+  setCounts(parseResult.counts);
+  $("#effectiveBoundary").textContent = parseResult.effectiveBoundary ?? "—（无）";
+  const metaBits = [];
+  metaBits.push(`媒体类型 <b>${escapeHtml(parseResult.mediaType || "—")}</b>`);
+  metaBits.push(`原始大小 <b>${humanSize(tree.rawSize || 0)}</b>`);
+  metaBits.push(`行结束 <b>${parseResult.normalizedCrlf ? "已规范化为 CRLF" : "CRLF"}</b>`);
+  metaBits.push(`顶层头部 <b>${parseResult.hasTopHeaders ? "检测到" : "未检测到"}</b>`);
+  metaBits.push(`来源 <b>${escapeHtml(snap.label)}</b>`);
+  $("#parseMeta").innerHTML = metaBits.join("　·　");
+  $("#issuesCard").classList.remove("hidden");
+  $("#treeCard").classList.remove("hidden");
+  renderIssues($("#issuesList"), parseResult.issues || []);
+  rerenderTree();
+  return true;
+}
+
+function clearSnapshot(side) {
+  snapshots[side] = null;
+  persistSnapshot(side);
+  resetDiffView();
+  renderSnapSlots();
+}
+
+function persistSnapshot(side) {
+  try {
+    if (snapshots[side]) {
+      localStorage.setItem(SNAP_LS_KEY[side], JSON.stringify(snapshots[side]));
+    } else {
+      localStorage.removeItem(SNAP_LS_KEY[side]);
+    }
+  } catch (_) {
+    // 隐私模式 / 超出配额：仅保留内存副本
+  }
+}
+
+function restoreSnapshots() {
+  for (const side of ["a", "b"]) {
+    try {
+      const raw = localStorage.getItem(SNAP_LS_KEY[side]);
+      if (raw) snapshots[side] = JSON.parse(raw);
+    } catch (_) { /* 损坏的缓存直接忽略 */ }
+  }
+}
+
+function snapshotMeta(side) {
+  const snap = snapshots[side];
+  if (!snap) return null;
+  const r = snap.result || {};
+  const t = r.tree || {};
+  return {
+    label: snap.label,
+    savedAt: snap.savedAt,
+    mediaType: r.mediaType ?? null,
+    rawSize: t.rawSize ?? null,
+    counts: r.counts ?? null,
+  };
+}
+
+function renderSnapSlots() {
+  for (const side of ["a", "b"]) {
+    const S = side.toUpperCase();
+    const snap = snapshots[side];
+    const metaEl = $("#snapMeta" + S);
+    if (snap) {
+      const r = snap.result || {};
+      const t = r.tree || {};
+      const c = r.counts || {};
+      const when = (snap.savedAt || "").replace("T", " ").slice(0, 19);
+      metaEl.innerHTML =
+        `<b>${escapeHtml(r.mediaType || "—")}</b> · ${humanSize(t.rawSize || 0)}` +
+        ` · 诊断 <b>${c.error || 0}</b>/<b>${c.warning || 0}</b>/<b>${c.info || 0}</b>` +
+        ` · ${escapeHtml(when)}`;
+    } else {
+      metaEl.textContent = "未保存（解析报文后点击“保存当前解析”）";
+    }
+    $("#btnSave" + S).disabled = !parseResult;
+    $("#btnLoad" + S).disabled = !snap;
+    $("#btnClear" + S).disabled = !snap;
+  }
+  $("#btnCompare").disabled = !(snapshots.a && snapshots.b);
+  if (!(snapshots.a && snapshots.b)) $("#btnExportDiff").disabled = true;
+}
+
+function resetDiffView() {
+  diffReport = null;
+  $("#diffResult").innerHTML = "";
+  $("#diffMeta").textContent = "";
+  $("#btnExportDiff").disabled = true;
+}
+
+async function doCompare() {
+  if (!snapshots.a || !snapshots.b) return;
+  $("#btnCompare").disabled = true;
+  try {
+    const data = await postJSON("/api/diff", {
+      a: { tree: snapshots.a.result.tree, issues: snapshots.a.result.issues || [] },
+      b: { tree: snapshots.b.result.tree, issues: snapshots.b.result.issues || [] },
+    });
+    diffReport = data;
+    renderDiff(data);
+  } catch (e) {
+    alert("对比失败：" + e.message);
+  } finally {
+    $("#btnCompare").disabled = false;
+  }
+}
+
+// ------------------------------------------------------------ diff render --
+
+function renderDiff(report) {
+  const box = $("#diffResult");
+  box.innerHTML = "";
+  const s = report.summary || {};
+  const total = (s.added || 0) + (s.removed || 0) + (s.modified || 0);
+  $("#diffMeta").innerHTML =
+    `样本 A <b>${escapeHtml(snapshots.a.result.mediaType || "—")}</b>` +
+    ` vs 样本 B <b>${escapeHtml(snapshots.b.result.mediaType || "—")}</b>` +
+    `　·　差异 <b>${total}</b> 处　·　未变节点 <b>${s.unchanged || 0}</b> 个`;
+
+  const sum = document.createElement("div");
+  sum.className = "diff-summary";
+  sum.innerHTML =
+    `<span class="chip diff-chip-added">新增 <b>${s.added || 0}</b></span>` +
+    `<span class="chip diff-chip-removed">删除 <b>${s.removed || 0}</b></span>` +
+    `<span class="chip diff-chip-modified">修改 <b>${s.modified || 0}</b></span>`;
+  box.appendChild(sum);
+
+  if (report.identical) {
+    const ok = document.createElement("div");
+    ok.className = "diff-identical";
+    ok.textContent = "✅ 两份样本在比较维度上完全一致";
+    box.appendChild(ok);
+  }
+
+  for (const kind of ["added", "removed", "modified"]) {
+    const entries = (report.entries || []).filter((e) => e.kind === kind);
+    if (entries.length) box.appendChild(diffGroup(kind, entries));
+  }
+  $("#btnExportDiff").disabled = false;
+}
+
+function diffGroup(kind, entries) {
+  const g = document.createElement("div");
+  g.className = `diff-group diff-${kind}`;
+  const head = document.createElement("div");
+  head.className = "diff-group-head";
+  head.innerHTML =
+    `<span class="caret">▼</span>` +
+    `<span class="diff-kind-badge">${DIFF_KIND_LABEL[kind]}</span>` +
+    `<span class="diff-count">${entries.length} 项</span>`;
+  head.addEventListener("click", () => g.classList.toggle("collapsed"));
+  const body = document.createElement("div");
+  body.className = "diff-group-body";
+  entries.forEach((e) => body.appendChild(diffEntry(e)));
+  g.appendChild(head);
+  g.appendChild(body);
+  return g;
+}
+
+function diffEntry(e) {
+  const div = document.createElement("div");
+  div.className = "diff-entry";
+
+  const head = document.createElement("div");
+  head.className = "diff-entry-head";
+  let mt;
+  if (e.kind === "modified") {
+    mt = e.mediaTypeA === e.mediaTypeB
+      ? (e.mediaTypeA ?? "—")
+      : `${e.mediaTypeA ?? "—"} → ${e.mediaTypeB ?? "—"}`;
+  } else {
+    mt = e.mediaType ?? e.nodeKind ?? "—";
+  }
+  let extra = "";
+  if (e.kind !== "modified" && (e.nodeCount || 0) > 1) {
+    extra += `<span class="meta-pill">含 ${e.nodeCount} 个节点</span>`;
+  }
+  if (e.name != null) extra += `<span class="meta-pill">name=${escapeHtml(e.name)}</span>`;
+  if (e.filename != null) extra += `<span class="meta-pill">filename=${escapeHtml(e.filename)}</span>`;
+  head.innerHTML =
+    `<code class="diff-path">${escapeHtml(e.path)}</code>` +
+    `<span class="diff-mt">${escapeHtml(mt)}</span>` + extra;
+
+  const loc = document.createElement("span");
+  loc.className = "diff-locate";
+  const sides = e.kind === "added" ? ["b"] : e.kind === "removed" ? ["a"] : ["a", "b"];
+  for (const side of sides) {
+    const btn = document.createElement("button");
+    btn.className = "btn btn-sm btn-ghost";
+    btn.type = "button";
+    btn.textContent = `定位 ${side.toUpperCase()}`;
+    btn.title = `在样本 ${side.toUpperCase()} 的结构树中定位该节点`;
+    btn.addEventListener("click", (ev) => {
+      ev.stopPropagation();
+      locateNode(side, e.path);
+    });
+    loc.appendChild(btn);
+  }
+  head.appendChild(loc);
+  div.appendChild(head);
+
+  if (e.kind === "modified" && (e.changes || []).length) {
+    const box = document.createElement("div");
+    box.className = "diff-changes";
+    e.changes.forEach((ch) => box.appendChild(diffChange(ch)));
+    div.appendChild(box);
+  }
+  return div;
+}
+
+function fmtScalar(v) {
+  if (v === null || v === undefined) return "（无）";
+  if (v === "") return "（空）";
+  if (typeof v === "boolean") return v ? "是" : "否";
+  const s = String(v);
+  return s.length > 120 ? s.slice(0, 120) + "…" : s;
+}
+
+function diffChange(ch) {
+  const div = document.createElement("div");
+  div.className = "diff-change";
+  const label = DIFF_FIELD_LABEL[ch.field] || ch.field;
+
+  if (ch.field === "headers") {
+    const rows = [];
+    for (const h of ch.removed || []) {
+      rows.push(`<div class="dh removed">− ${escapeHtml(h.name)}: ${escapeHtml(h.values.join(" | "))}</div>`);
+    }
+    for (const h of ch.added || []) {
+      rows.push(`<div class="dh added">+ ${escapeHtml(h.name)}: ${escapeHtml(h.values.join(" | "))}</div>`);
+    }
+    for (const h of ch.changed || []) {
+      rows.push(
+        `<div class="dh changed">~ ${escapeHtml(h.name)}: ` +
+        `<span class="old">${escapeHtml(h.a.join(" | "))}</span> → ` +
+        `<span class="new">${escapeHtml(h.b.join(" | "))}</span></div>`);
+    }
+    div.innerHTML =
+      `<span class="diff-field">${escapeHtml(label)}</span>` +
+      `<div class="dh-box">${rows.join("")}</div>`;
+  } else if (ch.field === "issues") {
+    const rows = [];
+    for (const c of ch.removed || []) rows.push(`<div class="dh removed">− ${escapeHtml(c)}</div>`);
+    for (const c of ch.added || []) rows.push(`<div class="dh added">+ ${escapeHtml(c)}</div>`);
+    const fmt = (arr) => (arr && arr.length ? arr.map(escapeHtml).join(", ") : "无");
+    div.innerHTML =
+      `<span class="diff-field">${escapeHtml(label)}</span>` +
+      `<div class="dh-box">${rows.join("")}</div>` +
+      `<div class="dh muted">A：[${fmt(ch.a)}]　B：[${fmt(ch.b)}]</div>`;
+  } else if (Object.prototype.hasOwnProperty.call(ch, "aPreview")) {
+    div.innerHTML =
+      `<span class="diff-field">${escapeHtml(label)}</span>` +
+      `<div class="dh-box">` +
+      `<div class="dh removed">A（${ch.aLength} 字符）：${escapeHtml(ch.aPreview ?? "（无）")}</div>` +
+      `<div class="dh added">B（${ch.bLength} 字符）：${escapeHtml(ch.bPreview ?? "（无）")}</div>` +
+      `</div>`;
+  } else {
+    div.innerHTML =
+      `<span class="diff-field">${escapeHtml(label)}</span>` +
+      `<code class="diff-val a">${escapeHtml(fmtScalar(ch.a))}</code>` +
+      ` → <code class="diff-val b">${escapeHtml(fmtScalar(ch.b))}</code>`;
+  }
+  return div;
+}
+
+// ------------------------------------------------------------ diff locate --
+
+function locateNode(side, path) {
+  if (!snapshots[side]) return;
+  // 编辑器当前不是该样本时先载入；已是该样本则保留用户的编辑状态
+  if (editorSource !== side) loadSnapshotIntoEditor(side);
+  const target = $$("#treeRoot .node").find((el) => el.dataset.path === path);
+  if (!target) {
+    alert(`当前编辑器中找不到节点 ${path}（结构可能已被编辑）`);
+    return;
+  }
+  let p = target.parentElement;
+  while (p && p.id !== "treeRoot") {
+    if (p.classList && p.classList.contains("node")) p.classList.remove("collapsed");
+    p = p.parentElement;
+  }
+  target.scrollIntoView({ behavior: "smooth", block: "center" });
+  target.classList.add("flash");
+  setTimeout(() => target.classList.remove("flash"), 1800);
+}
+
+// ------------------------------------------------------------ diff export --
+
+function exportDiff() {
+  if (!diffReport) return;
+  const payload = {
+    tool: "mime-multipart-inspector",
+    kind: "sample-diff-report",
+    exportedAt: new Date().toISOString(),
+    snapshots: { a: snapshotMeta("a"), b: snapshotMeta("b") },
+    ...diffReport,
+  };
+  const blob = new Blob([JSON.stringify(payload, null, 2)], { type: "application/json" });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = "mime-diff-report.json";
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  setTimeout(() => URL.revokeObjectURL(url), 1000);
+}
+
 // ----------------------------------------------------------------- init --
 
 function init() {
@@ -511,6 +875,17 @@ function init() {
       if (parseResult) renderIssues($("#issuesList"), parseResult.issues);
     });
   });
+  // 样本对比
+  $("#btnSaveA").addEventListener("click", () => saveSnapshot("a"));
+  $("#btnSaveB").addEventListener("click", () => saveSnapshot("b"));
+  $("#btnLoadA").addEventListener("click", () => loadSnapshotIntoEditor("a"));
+  $("#btnLoadB").addEventListener("click", () => loadSnapshotIntoEditor("b"));
+  $("#btnClearA").addEventListener("click", () => clearSnapshot("a"));
+  $("#btnClearB").addEventListener("click", () => clearSnapshot("b"));
+  $("#btnCompare").addEventListener("click", doCompare);
+  $("#btnExportDiff").addEventListener("click", exportDiff);
+  restoreSnapshots();
+  renderSnapSlots();
   // 默认载入表单示例，打开即可体验
   fillSample($("#rawInput"), SAMPLE_BASIC);
 }
