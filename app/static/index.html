@@ -70,8 +70,12 @@
   <section class="card hidden" id="treeCard">
     <div class="card-head">
       <h2>2. 报文结构（可编辑）</h2>
-      <div class="hint">直接修改头部、正文、boundary、preamble/epilogue；multipart 可增删部分。未改动的部分按原字节还原。</div>
+      <div class="head-actions">
+        <button id="btnSaveA" class="btn btn-sm" type="button">存为样本 A</button>
+        <button id="btnSaveB" class="btn btn-sm" type="button">存为样本 B</button>
+      </div>
     </div>
+    <div class="hint tree-hint">直接修改头部、正文、boundary、preamble/epilogue；multipart 可增删部分。未改动的部分按原字节还原。</div>
     <div id="treeRoot"></div>
 
     <div class="encode-bar">
@@ -99,6 +103,60 @@
       </label>
     </div>
     <textarea id="outputPreview" class="hidden" spellcheck="false" wrap="off" readonly></textarea>
+  </section>
+
+  <section class="card" id="compareCard">
+    <div class="card-head">
+      <h2>4. 样本对比</h2>
+      <div class="hint">把解析结果分别存为样本 A / B（保存在浏览器 localStorage，可来自不同报文或编辑前后），按树路径对齐比较媒体类型、头部、正文编码、boundary、序言/尾注与诊断代码。</div>
+    </div>
+
+    <div class="sample-slots">
+      <div class="slot" id="slotA">
+        <div class="slot-head">
+          <span class="slot-badge badge-a">A</span>
+          <span class="slot-title">样本 A</span>
+          <span class="node-spacer"></span>
+          <button class="btn btn-sm btn-danger slot-clear" data-slot="a" type="button">清除</button>
+        </div>
+        <div class="slot-meta">空 — 解析报文后点击「存为样本 A」</div>
+      </div>
+      <div class="slot" id="slotB">
+        <div class="slot-head">
+          <span class="slot-badge badge-b">B</span>
+          <span class="slot-title">样本 B</span>
+          <span class="node-spacer"></span>
+          <button class="btn btn-sm btn-danger slot-clear" data-slot="b" type="button">清除</button>
+        </div>
+        <div class="slot-meta">空 — 解析报文后点击「存为样本 B」</div>
+      </div>
+    </div>
+
+    <div class="actions">
+      <button id="btnCompare" class="btn btn-primary" type="button" disabled>开始对比</button>
+      <button id="btnExportDiff" class="btn" type="button" disabled>导出 JSON 差异报告</button>
+      <span id="diffMeta" class="parse-meta"></span>
+    </div>
+
+    <div id="diffResult" class="hidden">
+      <div class="diff-filters">
+        <button class="chip chip-added active" data-change="added" type="button">新增 <b id="cntAdded">0</b></button>
+        <button class="chip chip-removed active" data-change="removed" type="button">删除 <b id="cntRemoved">0</b></button>
+        <button class="chip chip-modified active" data-change="modified" type="button">修改 <b id="cntModified">0</b></button>
+        <button class="chip chip-unchanged" data-change="unchanged" type="button">未变化 <b id="cntUnchanged">0</b></button>
+      </div>
+      <ul id="diffList" class="diff-list"></ul>
+      <div class="diff-trees">
+        <div class="diff-tree-panel">
+          <div class="diff-tree-title">样本 A 结构（点击差异条目的 A 按钮定位）</div>
+          <div id="diffTreeA"></div>
+        </div>
+        <div class="diff-tree-panel">
+          <div class="diff-tree-title">样本 B 结构（点击差异条目的 B 按钮定位）</div>
+          <div id="diffTreeB"></div>
+        </div>
+      </div>
+    </div>
   </section>
 </main>
 

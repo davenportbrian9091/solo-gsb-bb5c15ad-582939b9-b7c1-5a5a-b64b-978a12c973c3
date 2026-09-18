@@ -9,6 +9,12 @@ let tree = null;              // 当前可编辑树（对象引用，控件直�
 let encodedBytes = null;      // Uint8Array 编码结果
 const issueFilter = { error: true, warning: true, info: true };
 
+// 样本对比：A/B 两份解析结果快照（localStorage 持久化）与最近一次 diff 结果
+const SAMPLES = { a: null, b: null };
+let diffResult = null;
+const diffFilter = { added: true, removed: true, modified: true, unchanged: false };
+const CHANGE_LABEL = { added: "新增", removed: "删除", modified: "修改", unchanged: "未变化" };
+
 // ---------------------------------------------------------------- samples --
 
 // 说明：RFC 2046 要求首定界符前有 CRLF；顶层头部块后的空行已提供该 CRLF，
@@ -484,8 +490,334 @@ async function copyOutput() {
   }
 }
 
-// ----------------------------------------------------------------- init --
+// --------------------------------------------------------- sample compare --
 
+function countParts(node) {
+  let n = 0;
+  (function walk(nd) {
+    (nd.parts || []).forEach((c) => { n += 1; walk(c); });
+  })(node || {});
+  return n;
+}
+
+function loadSamples() {
+  for (const slot of ["a", "b"]) {
+    try {
+      const raw = localStorage.getItem("mime-sample-" + slot);
+      if (raw) SAMPLES[slot] = JSON.parse(raw);
+    } catch (_) { /* 损坏的数据直接忽略 */ }
+  }
+}
+
+function persistSample(slot) {
+  try {
+    if (SAMPLES[slot]) {
+      localStorage.setItem("mime-sample-" + slot, JSON.stringify(SAMPLES[slot]));
+    } else {
+      localStorage.removeItem("mime-sample-" + slot);
+    }
+  } catch (_) {
+    alert("样本过大，无法写入 localStorage；仅在当前页面有效。");
+  }
+}
+
+function invalidateDiff() {
+  diffResult = null;
+  $("#diffResult").classList.add("hidden");
+  $("#btnExportDiff").disabled = true;
+  $("#diffMeta").textContent = "";
+}
+
+function saveSample(slot) {
+  if (!tree) {
+    alert("请先解析报文，再保存为样本");
+    return;
+  }
+  reindexPaths(tree, "root");
+  SAMPLES[slot] = {
+    tree: JSON.parse(JSON.stringify(tree)),   // 深拷贝快照，后续编辑不影响样本
+    issues: (parseResult && parseResult.issues) || [],
+    counts: (parseResult && parseResult.counts) || null,
+    mediaType: (parseResult && parseResult.mediaType) || tree.mediaType || null,
+    savedAt: Date.now(),
+  };
+  persistSample(slot);
+  invalidateDiff();
+  renderSlots();
+}
+
+function clearSample(slot) {
+  SAMPLES[slot] = null;
+  persistSample(slot);
+  invalidateDiff();
+  renderSlots();
+}
+
+function renderSlots() {
+  for (const slot of ["a", "b"]) {
+    const el = $(slot === "a" ? "#slotA" : "#slotB");
+    const meta = $(".slot-meta", el);
+    const s = SAMPLES[slot];
+    el.classList.toggle("filled", !!s);
+    if (!s) {
+      meta.textContent = `空 — 解析报文后点击「存为样本 ${slot.toUpperCase()}」`;
+    } else {
+      const c = s.counts || {};
+      const time = new Date(s.savedAt).toLocaleString();
+      meta.textContent =
+        `${s.mediaType || "未知类型"} · ${countParts(s.tree)} 个部分 · ` +
+        `诊断 ${c.error || 0}错/${c.warning || 0}警/${c.info || 0}提示 · 保存于 ${time}`;
+    }
+  }
+  $("#btnCompare").disabled = !(SAMPLES.a && SAMPLES.b);
+}
+
+async function doCompare() {
+  if (!SAMPLES.a || !SAMPLES.b) return;
+  $("#btnCompare").disabled = true;
+  try {
+    const data = await postJSON("/api/diff", {
+      a: { tree: SAMPLES.a.tree, issues: SAMPLES.a.issues || [] },
+      b: { tree: SAMPLES.b.tree, issues: SAMPLES.b.issues || [] },
+    });
+    diffResult = data;
+    renderDiff(data);
+    $("#btnExportDiff").disabled = false;
+  } catch (e) {
+    alert("对比失败：" + e.message);
+  } finally {
+    $("#btnCompare").disabled = false;
+  }
+}
+
+function renderDiff(data) {
+  const s = data.summary || {};
+  $("#cntAdded").textContent = s.added || 0;
+  $("#cntRemoved").textContent = s.removed || 0;
+  $("#cntModified").textContent = s.modified || 0;
+  $("#cntUnchanged").textContent = s.unchanged || 0;
+  $("#diffMeta").innerHTML =
+    `新增 <b>${s.added || 0}</b> · 删除 <b>${s.removed || 0}</b> · ` +
+    `修改 <b>${s.modified || 0}</b> · 未变化 <b>${s.unchanged || 0}</b>`;
+  $("#diffResult").classList.remove("hidden");
+
+  const changeMap = {};
+  for (const e of data.entries || []) if (e.path) changeMap[e.path] = e.change;
+
+  renderDiffList(data.entries || []);
+  renderDiffTree("#diffTreeA", SAMPLES.a.tree, changeMap);
+  renderDiffTree("#diffTreeB", SAMPLES.b.tree, changeMap);
+  $("#diffResult").scrollIntoView({ behavior: "smooth", block: "start" });
+}
+
+function renderDiffList(entries) {
+  const list = $("#diffList");
+  list.innerHTML = "";
+  const shown = entries.filter((e) => diffFilter[e.change] !== false);
+  if (!shown.length) {
+    const li = document.createElement("li");
+    li.className = "diff-empty";
+    li.textContent = "当前筛选下没有差异条目";
+    list.appendChild(li);
+    return;
+  }
+  for (const e of shown) list.appendChild(renderDiffEntry(e));
+}
+
+function briefText(s, prefix) {
+  if (!s) return prefix;
+  const bits = [s.mediaType || "?", `${s.descendantParts || 0} 个后代部分`,
+                `${s.headers || 0} 条头部`, humanSize(s.rawSize || 0)];
+  return `${prefix} · ${bits.join(" · ")}`;
+}
+
+function summarizeFields(e) {
+  if (e.change === "added") return briefText(e.summary, "仅存在于样本 B");
+  if (e.change === "removed") return briefText(e.summary, "仅存在于样本 A");
+  if (e.change === "unchanged") return "一致";
+  return (e.fields || []).map((f) => {
+    if (f.field === "headers") {
+      return `头部 +${f.added.length}/-${f.removed.length}${f.reordered ? "·仅顺序" : ""}`;
+    }
+    if (f.field === "issues") return `诊断 +${f.added.length}/-${f.removed.length}`;
+    return f.label;
+  }).join(" · ");
+}
+
+function renderDiffEntry(e) {
+  const li = document.createElement("li");
+  li.className = `diff-entry chg-${e.change} collapsed`;
+  const isGlobal = !e.path;
+
+  const bar = document.createElement("div");
+  bar.className = "diff-entry-bar";
+  bar.innerHTML =
+    `<span class="caret">▼</span>` +
+    `<span class="chg-badge ${e.change}">${CHANGE_LABEL[e.change] || e.change}</span>` +
+    `<span class="diff-path">${isGlobal ? "（全局诊断）" : escapeHtml(e.path)}</span>` +
+    `<span class="diff-fields-summary">${escapeHtml(summarizeFields(e))}</span>` +
+    `<span class="node-spacer"></span>`;
+  if (!isGlobal) {
+    if (e.change !== "added") bar.appendChild(locateBtn("a", e.path));
+    if (e.change !== "removed") bar.appendChild(locateBtn("b", e.path));
+  }
+  bar.addEventListener("click", (ev) => {
+    if (ev.target.closest("button")) return;
+    li.classList.toggle("collapsed");
+  });
+  li.appendChild(bar);
+
+  const body = document.createElement("div");
+  body.className = "diff-entry-body";
+  if (e.change === "added" || e.change === "removed") {
+    const brief = document.createElement("div");
+    brief.className = "hint diff-brief";
+    brief.textContent = summarizeFields(e) + "（整棵子树已折叠为一条）";
+    body.appendChild(brief);
+  }
+  for (const f of e.fields || []) body.appendChild(renderField(f));
+  if (!(e.fields || []).length && e.change !== "added" && e.change !== "removed") {
+    body.innerHTML = '<div class="hint">无字段级差异</div>';
+  }
+  li.appendChild(body);
+  return li;
+}
+
+function valHtml(v) {
+  if (!v || v.text == null) return '<span class="trunc-note">（无）</span>';
+  const t = escapeHtml(v.text);
+  return v.truncated
+    ? `${t}<span class="trunc-note"> …（已截断，共 ${v.length} 字符）</span>` : t;
+}
+
+function renderField(f) {
+  const div = document.createElement("div");
+  div.className = "diff-field";
+  if (f.field === "headers") {
+    let html = `<div class="diff-field-label">头部（A ${f.aCount} 条 / B ${f.bCount} 条）</div>`;
+    for (const line of f.removed) html += `<div class="hdr-line del">− ${escapeHtml(line)}</div>`;
+    for (const line of f.added) html += `<div class="hdr-line add">+ ${escapeHtml(line)}</div>`;
+    if (f.reordered) html += `<div class="hint">头部内容一致，仅顺序不同</div>`;
+    div.innerHTML = html;
+    return div;
+  }
+  if (f.field === "issues") {
+    let html = `<div class="diff-field-label">${escapeHtml(f.label)}</div><div class="issue-diff">`;
+    for (const c of f.removed) html += `<span class="issue-pill del">− ${escapeHtml(c)}</span>`;
+    for (const c of f.added) html += `<span class="issue-pill add">+ ${escapeHtml(c)}</span>`;
+    html += "</div>";
+    div.innerHTML = html;
+    return div;
+  }
+  const table = document.createElement("table");
+  table.className = "diff-field-table";
+  table.innerHTML =
+    `<tr><th rowspan="2">${escapeHtml(f.label)}</th>` +
+    `<td><span class="side-tag">A</span> <span class="diff-val old">${valHtml(f.a)}</span></td></tr>` +
+    `<tr><td><span class="side-tag">B</span> <span class="diff-val new">${valHtml(f.b)}</span></td></tr>`;
+  div.appendChild(table);
+  return div;
+}
+
+function renderDiffTree(sel, sampleTree, changeMap) {
+  const el = $(sel);
+  el.innerHTML = "";
+  if (!sampleTree) {
+    el.textContent = "（空）";
+    return;
+  }
+  el.appendChild(renderRoNode(sampleTree, changeMap));
+}
+
+function renderRoNode(node, changeMap) {
+  const wrap = document.createElement("div");
+  wrap.className = "ro-node";
+  wrap.dataset.diffPath = node.path || "";
+  const change = changeMap[node.path];
+  if (change && change !== "unchanged") wrap.classList.add("chg-" + change);
+  const hasKids = node.kind === "multipart" && (node.parts || []).length > 0;
+  const bar = document.createElement("div");
+  bar.className = "ro-bar";
+  bar.innerHTML =
+    `<span class="caret">${hasKids ? "▼" : "·"}</span>` +
+    `<span class="badge ${node.kind === "multipart" ? "multipart" : ""}">` +
+    `${escapeHtml(node.mediaType || "?")}</span>` +
+    `<span class="node-title">${escapeHtml(node.path || "")}</span>` +
+    (change && change !== "unchanged"
+      ? `<span class="chg-tag tag-${change}">${CHANGE_LABEL[change]}</span>` : "");
+  if (hasKids) {
+    bar.addEventListener("click", () => wrap.classList.toggle("collapsed"));
+    const kids = document.createElement("div");
+    kids.className = "ro-kids";
+    node.parts.forEach((c) => kids.appendChild(renderRoNode(c, changeMap)));
+    wrap.appendChild(bar);
+    wrap.appendChild(kids);
+  } else {
+    wrap.appendChild(bar);
+  }
+  return wrap;
+}
+
+function locateBtn(slot, path) {
+  const b = document.createElement("button");
+  b.className = "btn btn-sm locate-btn";
+  b.type = "button";
+  b.textContent = slot.toUpperCase();
+  b.title = `在样本 ${slot.toUpperCase()} 结构树中定位该节点`;
+  b.addEventListener("click", (ev) => {
+    ev.stopPropagation();
+    locateNode(slot, path);
+  });
+  return b;
+}
+
+function locateNode(slot, path) {
+  const panel = $(slot === "a" ? "#diffTreeA" : "#diffTreeB");
+  const el = panel.querySelector(`[data-diff-path="${path}"]`);
+  if (!el) return;
+  // 展开所有祖先节点
+  let p = el.parentElement;
+  while (p && p !== panel) {
+    if (p.classList && p.classList.contains("ro-node")) p.classList.remove("collapsed");
+    p = p.parentElement;
+  }
+  el.scrollIntoView({ behavior: "smooth", block: "center" });
+  el.classList.remove("flash");
+  void el.offsetWidth;   // 重新触发高亮动画
+  el.classList.add("flash");
+  setTimeout(() => el.classList.remove("flash"), 1600);
+}
+
+function exportDiff() {
+  if (!diffResult) return;
+  const metaOf = (s) => s ? {
+    mediaType: s.mediaType,
+    savedAt: new Date(s.savedAt).toISOString(),
+    parts: countParts(s.tree),
+    counts: s.counts || null,
+  } : null;
+  const report = {
+    tool: "mime-multipart-inspector",
+    report: "sample-diff",
+    version: 1,
+    generatedAt: new Date().toISOString(),
+    sampleA: metaOf(SAMPLES.a),
+    sampleB: metaOf(SAMPLES.b),
+    summary: diffResult.summary,
+    entries: diffResult.entries,
+  };
+  const blob = new Blob([JSON.stringify(report, null, 2)], { type: "application/json" });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = "mime-diff-report.json";
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  setTimeout(() => URL.revokeObjectURL(url), 1000);
+}
+
+// ----------------------------------------------------------------- init --
 function init() {
   $("#btnParse").addEventListener("click", doParse);
   $("#btnEncode").addEventListener("click", () => doEncode(true));
@@ -511,6 +843,24 @@ function init() {
       if (parseResult) renderIssues($("#issuesList"), parseResult.issues);
     });
   });
+  // 样本对比
+  $("#btnSaveA").addEventListener("click", () => saveSample("a"));
+  $("#btnSaveB").addEventListener("click", () => saveSample("b"));
+  $$(".slot-clear").forEach((b) => {
+    b.addEventListener("click", () => clearSample(b.dataset.slot));
+  });
+  $("#btnCompare").addEventListener("click", doCompare);
+  $("#btnExportDiff").addEventListener("click", exportDiff);
+  $$(".diff-filters .chip").forEach((chip) => {
+    chip.addEventListener("click", () => {
+      const c = chip.dataset.change;
+      diffFilter[c] = !diffFilter[c];
+      chip.classList.toggle("active", diffFilter[c]);
+      if (diffResult) renderDiffList(diffResult.entries || []);
+    });
+  });
+  loadSamples();
+  renderSlots();
   // 默认载入表单示例，打开即可体验
   fillSample($("#rawInput"), SAMPLE_BASIC);
 }

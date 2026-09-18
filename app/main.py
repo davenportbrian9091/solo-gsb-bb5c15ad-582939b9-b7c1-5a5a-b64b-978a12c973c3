@@ -9,6 +9,7 @@ from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
+from .diff import diff_results
 from .mime import encode_tree, parse_message
 
 app = FastAPI(
@@ -39,6 +40,17 @@ class EncodeRequest(BaseModel):
     model_config = {"populate_by_name": True}
 
 
+class DiffSample(BaseModel):
+    tree: dict = Field(default_factory=dict, description="一份 /api/parse 返回的 tree")
+    issues: list[dict] = Field(default_factory=list,
+                               description="同一次解析返回的 issues（用于诊断代码对比）")
+
+
+class DiffRequest(BaseModel):
+    a: DiffSample
+    b: DiffSample
+
+
 @app.get("/api/health")
 def health():
     return {"ok": True}
@@ -54,6 +66,12 @@ def api_parse(req: ParseRequest):
 @app.post("/api/encode")
 def api_encode(req: EncodeRequest):
     result = encode_tree(req.tree, req.include_headers)
+    return JSONResponse(result)
+
+
+@app.post("/api/diff")
+def api_diff(req: DiffRequest):
+    result = diff_results(req.a.model_dump(), req.b.model_dump())
     return JSONResponse(result)
 
 

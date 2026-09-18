@@ -3,7 +3,7 @@ import base64
 import sys
 
 sys.path.insert(0, ".")
-from app import mime
+from app import diff, mime
 
 PASS = 0
 FAIL = 0
@@ -195,6 +195,114 @@ check("epilogue 识别", r10p["tree"]["epilogue"] == "tail", repr(r10p["tree"]["
 enc10 = mime.encode_tree(r10p["tree"], include_headers=False)
 out10 = base64.b64decode(enc10["payloadBase64"])
 check("body-only 带序言往返", out10 == raw10, f"\n{out10!r}\n!=\n{raw10!r}")
+
+# 11. 样本对比：媒体类型 / 头部 / 正文 / boundary / 序言 / 诊断 --------------
+print("11) 样本对比 diff_results")
+rawA = (
+    b'Content-Type: multipart/mixed; boundary=AA\r\n\r\n'
+    b'pre\r\n'
+    b'--AA\r\nContent-Type: text/plain\r\n\r\nhello\r\n'
+    b'--AA\r\nContent-Type: text/html\r\nX-Extra: 1\r\n\r\n<b>hi</b>\r\n'
+    b'--AA--\r\nepi'
+)
+rawB = (
+    b'Content-Type: multipart/mixed; boundary=BB\r\n\r\n'
+    b'pre2\r\n'
+    b'--BB\r\nContent-Type: text/plain\r\n\r\nhello\r\n'
+    b'--BB\r\nContent-Type: text/html; charset=utf-8\r\n\r\n<b>hi2</b>\r\n'
+    b'--BB\r\nContent-Type: application/json\r\n\r\n{}\r\n'
+    b'--BB--\r\nepi'
+)
+sa = mime.parse_message(rawA.decode(), None, None)
+sb = mime.parse_message(rawB.decode(), None, None)
+d = diff.diff_results({"tree": sa["tree"], "issues": sa["issues"]},
+                      {"tree": sb["tree"], "issues": sb["issues"]})
+check("diff ok", d["ok"] is True)
+by_path = {e["path"]: e for e in d["entries"]}
+check("新增 1 个部分", d["summary"]["added"] == 1, d["summary"])
+check("无删除", d["summary"]["removed"] == 0, d["summary"])
+check("parts[2] 标记为新增", by_path["parts[2]"]["change"] == "added")
+check("parts[0] 完全一致", by_path["parts[0]"]["change"] == "unchanged")
+root_fields = {f["field"] for f in by_path["root"]["fields"]}
+check("root 检出 boundary 变化", "boundary" in root_fields, root_fields)
+check("root 检出序言变化", "preamble" in root_fields, root_fields)
+check("root 未误报尾注变化", "epilogue" not in root_fields, root_fields)
+p1_fields = {f["field"]: f for f in by_path["parts[1]"]["fields"]}
+check("parts[1] 检出正文变化", "body" in p1_fields, list(p1_fields))
+check("parts[1] 检出头部变化", "headers" in p1_fields, list(p1_fields))
+check("头部新增 Content-Type 行",
+      any("charset" in l for l in p1_fields["headers"]["added"]),
+      p1_fields["headers"])
+check("头部删除 X-Extra 行",
+      any(l.startswith("X-Extra") for l in p1_fields["headers"]["removed"]),
+      p1_fields["headers"])
+check("正文预览带长度", p1_fields["body"]["b"]["length"] == len("<b>hi2</b>"))
+
+# 11b. 反向对比：新增变删除；诊断代码差异 ------------------------------------
+d2 = diff.diff_results({"tree": sb["tree"], "issues": sb["issues"]},
+                       {"tree": sa["tree"], "issues": sa["issues"]})
+by_path2 = {e["path"]: e for e in d2["entries"]}
+check("反向 parts[2] 标记为删除", by_path2["parts[2]"]["change"] == "removed")
+check("反向 summary 删除 1", d2["summary"]["removed"] == 1, d2["summary"])
+
+rawC = (b'Content-Type: multipart/mixed; boundary=AA\r\n\r\n'
+        b'--AA\r\nContent-Type: text/plain\r\n\r\nhello\r\n'
+        b'--AA\r\nContent-Type: text/html\r\nX-Extra: 1\r\n\r\n<b>hi</b>\r\n'
+        b'--AA--')
+sc = mime.parse_message(rawC.decode(), None, None)
+check("rawC 有序言诊断", any(i["code"] == "PREAMBLE" for i in sa["issues"]))
+d3 = diff.diff_results({"tree": sa["tree"], "issues": sa["issues"]},
+                       {"tree": sc["tree"], "issues": sc["issues"]})
+by_path3 = {e["path"]: e for e in d3["entries"]}
+root_issue_field = next((f for f in by_path3["root"]["fields"]
+                         if f["field"] == "issues"), None)
+check("root 检出诊断代码差异", root_issue_field is not None,
+      by_path3["root"]["fields"])
+check("PREAMBLE 仅存在于 A", root_issue_field
+      and "PREAMBLE" in root_issue_field["removed"], root_issue_field)
+
+# 11c. 嵌套子树整体删除折叠为一条；全局诊断 -----------------------------------
+rawD = (
+    b'Content-Type: multipart/mixed; boundary=O\r\n\r\n'
+    b'--O\r\nContent-Type: text/plain\r\n\r\nkeep\r\n'
+    b'--O\r\nContent-Type: multipart/alternative; boundary=I\r\n\r\n'
+    b'--I\r\nContent-Type: text/plain\r\n\r\np\r\n'
+    b'--I\r\nContent-Type: text/html\r\n\r\nh\r\n'
+    b'--I--\r\n'
+    b'--O--'
+)
+rawE = (b'Content-Type: multipart/mixed; boundary=O\r\n\r\n'
+        b'--O\r\nContent-Type: text/plain\r\n\r\nkeep\r\n'
+        b'--O--')
+sd_ = mime.parse_message(rawD.decode(), None, None)
+se = mime.parse_message(rawE.decode(), None, None)
+d4 = diff.diff_results({"tree": sd_["tree"], "issues": sd_["issues"]},
+                       {"tree": se["tree"], "issues": se["issues"]})
+removed_entries = [e for e in d4["entries"] if e["change"] == "removed"]
+check("嵌套子树删除折叠为 1 条", len(removed_entries) == 1,
+      [(e["path"], e["change"]) for e in d4["entries"]])
+check("删除摘要带后代数量",
+      removed_entries[0]["summary"]["descendantParts"] == 2,
+      removed_entries[0]["summary"])
+
+rawF = rawE.replace(b"\r\n", b"\n")  # 全 LF -> 触发全局 LF_NORMALIZED
+sf = mime.parse_message(rawF.decode("utf-8"), None, None)
+d5 = diff.diff_results({"tree": se["tree"], "issues": se["issues"]},
+                       {"tree": sf["tree"], "issues": sf["issues"]})
+global_entries = [e for e in d5["entries"] if e["path"] == ""]
+check("全局诊断差异单列一条", len(global_entries) == 1,
+      [(e["path"], e["change"]) for e in d5["entries"]])
+check("LF_NORMALIZED 为新增诊断",
+      "LF_NORMALIZED" in global_entries[0]["fields"][0]["added"],
+      global_entries[0]["fields"])
+
+# 11d. 完全相同 -> 全部 unchanged ---------------------------------------------
+d6 = diff.diff_results({"tree": sa["tree"], "issues": sa["issues"]},
+                       {"tree": sa["tree"], "issues": sa["issues"]})
+check("自比无差异", d6["summary"]["modified"] == 0
+      and d6["summary"]["added"] == 0 and d6["summary"]["removed"] == 0,
+      d6["summary"])
+check("自比全部 unchanged", d6["summary"]["unchanged"] == len(d6["entries"]))
 
 print(f"\n结果: {PASS} 通过, {FAIL} 失败")
 sys.exit(1 if FAIL else 0)
